@@ -1,0 +1,799 @@
+# 3/ TODO Creer le delete et autre etape
+# 4/ TEST & CLEAN & add comments
+# 5/ !!!!!!!!!! reflechir au system de MAJ de l'agent !!!!!!!!!!!
+
+#############################################################################
+#                             DEPLOY WORKFLOW
+#
+#  appId,
+#  appShortId,
+#  planId,
+#  artifacts,
+#
+#############################################################################
+main:
+    params: [args]
+    steps:
+
+      - deploy_app:
+          call: deploy_app_workflow
+          args:
+            serviceAccount: ${args.serviceAccount}
+            appId: ${args.appId}
+            appShortId: ${args.appShortId}
+            planId: ${args.planId}
+          result: deploy_result
+
+      - update_deployment_status:
+          try:
+            call: http.post
+            args:
+              url: ${"{{HOST_URL}}/workflow/updateStatus"}
+              auth:
+                type: OIDC
+                audience: {{HOST_URL}}
+              body: 
+                appId: ${args.appId}
+                planId: ${args.planId}
+                status: ${deploy_result.status}
+                error: ${deploy_result.error}
+          retry: ${http.default_retry}
+
+#############################################################################################
+# DEPLOY APP
+#############################################################################################
+deploy_app_workflow:
+  params: [serviceAccount, appId, appShortId, planId]
+  steps:
+
+    - try_step:
+        try:
+          steps:
+
+            # Handle the request:
+            #  - Download architecture and artifacts (only artifacts that are not already downloaded are downloaded)
+            #     As url are short lived url, we need to do that ASAP
+            #  - Returns the masterActions - exp is 6hours
+            - handle_request:
+                try:
+                  call: http.post
+                  args:
+                    url: ${"{{HOST_URL}}/workflow/handleRequest"}
+                    auth:
+                      type: OIDC
+                      audience: {{HOST_URL}}
+                    body: 
+                      appId: ${appId}
+                      planId: ${planId}
+                  result: init_response
+                retry: ${http.default_retry}
+
+            # Assign the masterActions
+            - assign_master_actions:
+                assign:
+                  - masterActions: ${init_response.body.masterActions}     
+
+            # Compute the plan
+            - compute_deployment_steps:
+                try:
+                  call: http.post
+                  args:
+                    url: ${"{{HOST_URL}}/workflow/computeDeploymentSteps"}
+                    auth:
+                      type: OIDC
+                      audience: {{HOST_URL}}
+                    timeout: 30
+                    body:
+                      appId: ${appId}
+                      planId: ${planId}
+                  result: steps_response
+                retry: ${http.default_retry}
+
+            # Assign the steps
+            - assign_steps:
+                assign:
+                  - steps: ${steps_response.body}      
+
+            # Execute in order the plan group of steps by group of steps that are done in //
+            - execute_plan:
+                for:
+                  value: array
+                  in: ${steps}
+                  steps:
+
+                    - get_outputs:
+                        try:
+                          call: http.post
+                          args:
+                            url: ${"{{HOST_URL}}/workflow/getAppOutputs"}
+                            auth:
+                              type: OIDC
+                              audience: {{HOST_URL}}
+                            body:
+                              appId: ${appId}
+                          result: outputs_response
+                        retry: ${http.default_retry}
+
+                    - assign_outputs:
+                        assign:
+                          - outputs: ${outputs_response.body}
+
+                    - execute_steps:
+                        parallel:
+                          for:
+                            value: step
+                            in: ${array}
+                            steps:
+
+                              - set_deployment_step_state_started:
+                                  try:
+                                    call: http.post
+                                    args:
+                                      url: ${"{{HOST_URL}}/workflow/setStepStatus"}
+                                      auth:
+                                        type: OIDC
+                                        audience: {{HOST_URL}}
+                                      body:
+                                        appId: ${appId}
+                                        planId: ${planId}
+                                        stepId: ${step.stepId}
+                                        progress: started
+                                        status: deploying
+                                  retry: ${http.default_retry}
+
+                              - update_state_deploying:
+                                  try:
+                                    call: http.post
+                                    args:
+                                      url: ${"{{HOST_URL}}/workflow/updateState"}
+                                      auth:
+                                        type: OIDC
+                                        audience: {{HOST_URL}}
+                                      body:
+                                        appId: ${appId}
+                                        type: ${step.type}
+                                        id: ${step.id}
+                                        action: ${step.action}
+                                        status: deploying
+                                        deploying: ${step.data}
+                                  retry: ${http.default_retry} 
+                                  
+                              - execute_step:
+                                  call: execute_step_workflow
+                                  args:
+                                    serviceAccount: ${serviceAccount}
+                                    step: ${step}
+                                    appId: ${appId}
+                                    appShortId: ${appShortId}
+                                    planId: ${planId}
+                                    masterActions: ${masterActions}
+                                    outputs: ${outputs}
+                                  result: step_result
+
+                              - update_state_finished:
+                                  try:
+                                    call: http.post
+                                    args:
+                                      url: ${"{{HOST_URL}}/workflow/updateState"}
+                                      auth:
+                                        type: OIDC
+                                        audience: {{HOST_URL}}
+                                      body:
+                                        appId: ${appId}
+                                        type: ${step.type}
+                                        id: ${step.id}
+                                        action: ${step.action}
+                                        status: ${step_result.status}
+                                        deploying: ${step_result.deploying}
+                                        deployed: ${step_result.deployed}
+                                        output: ${step_result.output}
+                                        error: ${step_result.error}
+                                  retry: ${http.default_retry} 
+
+                              - set_deployment_step_state_finished:
+                                  try:
+                                    call: http.post
+                                    args:
+                                      url: ${"{{HOST_URL}}/workflow/setStepStatus"}
+                                      auth:
+                                        type: OIDC
+                                        audience: {{HOST_URL}}
+                                      body:
+                                        appId: ${appId}
+                                        planId: ${planId}
+                                        stepId: ${step.stepId}
+                                        progress: finished
+                                        status: ${step_result.status}
+                                  retry: ${http.default_retry}
+
+                              - raise_error_check:
+                                  switch:
+                                    - condition: ${step_result.status == "failed"}
+                                      steps:
+                                        - raise_error:
+                                            raise: ${step_result.error}      
+
+            - assign_workflow_success:
+                return:
+                  status: deployed
+                  error: null
+
+        except:
+          as: e
+          steps:
+            - assign_workflow_failure:
+                return:
+                  status: failed
+                  error: ${e}
+
+#############################################################################################
+# EXECUTE STEP
+#############################################################################################
+execute_step_workflow:
+  params: [serviceAccount, step, appId, appShortId, planId, masterActions, outputs]
+  steps:
+
+    - try_execute_step:
+        try:
+          steps:
+
+            - execute_step:
+                switch:
+
+                    - condition: ${step.type == "services" AND (step.action == "create" OR step.action == "update")}
+                      steps:
+                        - service_deploy:
+                            call: service_deploy_workflow
+                            args:
+                              serviceAccount: ${serviceAccount}
+                              appId: ${appId}
+                              appShortId: ${appShortId}
+                              planId: ${planId}
+                              serviceId: ${step.id}
+                              service: ${step.data}
+                            result: result
+
+                    - condition: ${step.type == "layers" AND (step.action == "create" OR step.action == "update")}
+                      steps:
+                        - layer_deploy:
+                            call: service_layer_deploy_workflow
+                            args:
+                              appId: ${appId}
+                              appShortId: ${appShortId}
+                              planId: ${planId}
+                              layerId: ${step.id}
+                              layer: ${step.data}
+                            result: result
+
+                    - condition: ${step.type == "ids" AND step.action == "create"}
+                      steps:
+                        - id_create:
+                            call: id_create_workflow
+                            args:
+                              appId: ${appId}
+                              appShortId: ${appShortId}
+                            result: result
+
+                    - condition: ${step.type == "accounts" AND step.action == "create"}
+                      steps:
+                        - account_create:
+                            call: account_create_workflow
+                            args:
+                              accountId: ${step.id}
+                              service: ${step.data.service}
+                              outputs: ${outputs}
+                            result: result
+
+                    - condition: ${step.type == "resources" AND (step.action == "create" OR step.action == "update")}
+                      steps:
+                        - resource_deploy:
+                            call: resource_deploy_workflow
+                            args:
+                              appId: ${appId}
+                              appShortId: ${appShortId}
+                              planId: ${planId}
+                              resourceId: ${step.id}
+                              resource: ${step.data}
+                              masterActions: ${masterActions}
+                              outputs: ${outputs}
+                            result: result
+
+                    - condition: ${step.type == "resources" AND step.action == "delete"}
+                      steps:
+                        - resource_destroy:
+                            call: resource_destroy_workflow
+                            args:
+                              appId: ${appId}
+                              appShortId: ${appShortId}
+                              planId: ${planId}
+                              resourceId: ${step.id}
+                              resource: ${step.data}
+                              masterActions: ${masterActions}
+                              outputs: ${outputs}
+                            result: result
+
+                    - condition: ${step.type == "accounts" AND step.action == "delete"}
+                      steps:
+                        - account_delete:
+                            call: account_delete_workflow
+                            args:
+                              accountId: ${step.id}
+                              service: ${step.data.service}
+                              outputs: ${outputs}
+                            result: result
+
+                    - condition: ${step.type == "ids" AND step.action == "delete"}
+                      steps:
+                        - id_delete:
+                            call: id_delete_workflow
+                            args:
+                              appId: ${appId}
+                              appShortId: ${appShortId}
+                            result: result
+
+                    - condition: ${step.type == "layers" AND step.action == "delete"}
+                      steps:
+                        - layer_destroy:
+                            call: service_layer_destroy_workflow
+                            args:
+                              appId: ${appId}
+                              appShortId: ${appShortId}
+                              planId: ${planId}
+                              layerId: ${step.id}
+                              layer: ${step.data}
+                              outputs: ${outputs}
+                            result: result
+
+                    - condition: true
+                      steps:
+                        - fail:
+                            raise: ${"Step " + step.type + "/" + step.action + " not implemented."}              
+
+            - return_success:
+                return:
+                  deploying: null
+                  status: deployed
+                  deployed: ${step.data}
+                  output: ${result}
+                  error: null
+
+        except:
+          as: e
+          steps:
+
+            - log_error:
+                call: sys.log
+                args:
+                  text: ${"Step failed " + json.encode_to_string(e)}
+                  severity: "ERROR"
+
+            - return_fail:
+                return:
+                  deploying: ${step.data}
+                  status: failed
+                  deployed: null
+                  output: null
+                  error: ${e}
+
+#############################################################################################
+# DEPLOY A SERVICE
+#############################################################################################
+service_deploy_workflow:
+  params: [serviceAccount, planId, appId, appShortId, serviceId, service]
+  steps:
+
+    - download_cloud_build_yaml:
+        try:
+          call: http.post
+          args:
+            url: ${"{{HOST_URL}}/workflow/getServiceDeployYaml"}
+            auth:
+              type: OIDC
+              audience: {{HOST_URL}}
+            body: 
+              artifact: ${service.artifact}
+          result: cloudbuid_response
+        retry: ${http.default_retry}  
+
+    - execute_cloud_build_yaml:
+        call: googleapis.cloudbuild.v1.projects.builds.create
+        args:
+          projectId: {{PROJECT_ID}}
+          parent: ${"projects/{{PROJECT_ID}}/locations/global"}
+          body:
+            serviceAccount: ${"projects/{{PROJECT_ID}}/serviceAccounts/" + serviceAccount}
+            source:
+              storageSource:
+                bucket: {{SERVICES_ARCHIVE_BUCKET}}
+                object: ${service.artifact + ".zip"}
+            steps: ${cloudbuid_response.body.steps}
+            timeout: ${cloudbuid_response.body.timeout}
+            substitutions:
+              _PROJECT_ID: {{PROJECT_ID}}
+              _LOCATION: {{LOCATION}}
+              _SERVICE_ACCOUNT: ${serviceAccount}
+              _HOST_ID: "{{ORGANIZATION}}/{{HOST_NAME}}"
+              _HOST_SHORT_ID: {{HOST_SHORT_ID}}
+              _APP_ID: ${appId}
+              _APP_SHORT_ID: ${appShortId}
+              _PLAN_ID: ${planId}
+              _SERVICES_FILES_BUCKET: {{SERVICES_FILES_BUCKET}}
+              _RESOURCES_ARCHIVE_BUCKET: {{RESOURCES_ARCHIVE_BUCKET}}
+            options:
+              logging: CLOUD_LOGGING_ONLY
+        result: build
+
+    - return_output:
+        return: ${json.decode(base64.decode(build.metadata.build.results.buildStepOutputs[len(build.metadata.build.results.buildStepOutputs) - 1]))}
+
+#############################################################################################
+# DEPLOY A SERVICE LAYER
+#############################################################################################
+service_layer_deploy_workflow:
+  params: [appId, appShortId, planId, layerId, layer]
+  steps:
+
+    - service_layer_deploy:
+        switch:
+            - condition: ${text.match_regex(layerId, "_service_layer_nodejs$")}
+              steps:
+                - service_layer_deploy_nodejs:
+                    call: service_layer_deploy_nodejs_workflow
+                    args:
+                      appId: ${appId}
+                      appShortId: ${appShortId}
+                      planId: ${planId}
+                      layerId: ${layerId}
+                      layer: ${layer}
+                    result: output
+
+            - condition: true
+              steps:
+                - fail:
+                    raise: ${"Unknown layer name:" + layerId} 
+
+    - return_output:
+        return: ${output}
+
+# TODO raise error if no condition is matched
+
+#############################################################################################
+# DEPLOY A SERVICE LAYER - NODEJS
+#############################################################################################
+service_layer_deploy_nodejs_workflow:
+  params: [appId, appShortId, planId, layerId, layer]
+  steps:
+
+    - get_package_name:
+        try:
+          call: http.post
+          args:
+            url: ${"{{HOST_URL}}/workflow/getLayerPackageName"}
+            auth:
+              type: OIDC
+              audience: {{HOST_URL}}
+            body: 
+              layerId: ${layerId}
+          result: name_response
+        retry: ${http.default_retry}
+
+    - create_service_layer_nodejs:
+        call: googleapis.cloudbuild.v1.projects.builds.create
+        args:
+          projectId: {{PROJECT_ID}}
+          parent: ${"projects/{{PROJECT_ID}}/locations/global"}
+          body:
+            source:
+              storageSource:
+                bucket: {{SERVICES_ARCHIVE_BUCKET}}
+                object: ${layer.artifact + ".zip"}
+            steps:
+
+              - id: 'deploy layer'
+                name: 'gcr.io/cloud-builders/npm'
+                entrypoint: 'bash'
+                args:
+                - '-c'
+                - |
+                    set -e
+
+                    LAYER_ID=${_LAYER_ID};
+                    PACKAGE_NAME=${_PACKAGE_NAME};
+
+                    echo "@service:registry=https://{{LOCATION}}-npm.pkg.dev/{{PROJECT_ID}}/nodejs-packages-{{HOST_SHORT_ID}}/" >> ~/.npmrc
+                    echo "//{{LOCATION}}-npm.pkg.dev/{{PROJECT_ID}}/nodejs-packages/:always-auth=true" >> ~/.npmrc
+                    
+                    npm i google-artifactregistry-auth
+                    npm_config_registry=https://registry.npmjs.org npx google-artifactregistry-auth
+                    
+                    if npm view "$$PACKAGE_NAME" --registry=https://{{LOCATION}}-npm.pkg.dev/{{PROJECT_ID}}/nodejs-packages-{{HOST_SHORT_ID}}/ > /dev/null 2>&1; then
+                      VERSION=$(npm view "$$PACKAGE_NAME" version --registry=https://{{LOCATION}}-npm.pkg.dev/{{PROJECT_ID}}/nodejs-packages-{{HOST_SHORT_ID}}/)
+
+                      # Split the version into major, minor, and patch
+                      major=$(echo "$$VERSION" | cut -d '.' -f 1)
+                      minor=$(echo "$$VERSION" | cut -d '.' -f 2)
+                      patch=$(echo "$$VERSION" | cut -d '.' -f 3)
+
+                      # Increment the patch version
+                      major=$$((major + 1))
+
+                      # Rebuild the version string
+                      VERSION="$$major.$$minor.$$patch"
+                    else
+                      VERSION="1.0.0"
+                    fi
+
+                    npm pkg set name=$$PACKAGE_NAME version=$$VERSION
+                    npm publish --registry=https://{{LOCATION}}-npm.pkg.dev/{{PROJECT_ID}}/nodejs-packages-{{HOST_SHORT_ID}}/
+
+                    echo "{\"registry\":\"https://{{LOCATION}}-npm.pkg.dev/{{PROJECT_ID}}/nodejs-packages-{{HOST_SHORT_ID}}/\",\"package\":\"$${PACKAGE_NAME}\",\"version\":\"$${VERSION}\"}" >> $$BUILDER_OUTPUT/output
+
+            substitutions:
+              _LAYER_ID: ${layerId}
+              _PACKAGE_NAME: ${name_response.body.packageName}
+            options:
+              logging: CLOUD_LOGGING_ONLY
+        result: build
+
+    - return_output:
+        return: ${json.decode(base64.decode(build.metadata.build.results.buildStepOutputs[len(build.metadata.build.results.buildStepOutputs) - 1]))}
+
+#############################################################################################
+# CREATE A RESOURCE/MODULE UNIQUE ID
+#############################################################################################
+id_create_workflow:
+  params: [appId, appShortId]
+  steps:
+
+    - create_resource_short_id:
+        try:
+          call: http.post
+          args:
+            url: ${"{{HOST_URL}}/workflow/createResourceShortId"}
+            auth:
+              type: OIDC
+              audience: {{HOST_URL}}
+            body:
+              appId: ${appId}
+              appShortId: ${appShortId}
+          result: short_id_response
+        retry: ${http.default_retry}
+
+    - return_output:
+        return: ${short_id_response.body}
+
+#############################################################################################
+# DELETE A RESOURCE/MODULE UNIQUE ID
+#############################################################################################
+id_delete_workflow:
+  params: [appId, appShortId]
+  steps:
+
+    - delete_resource_short_id:
+        try:
+          call: http.post
+          args:
+            url: ${"{{HOST_URL}}/workflow/deleteResourceShortId"}
+            auth:
+              type: OIDC
+              audience: {{HOST_URL}}
+            body:
+              appId: ${appId}
+              appShortId: ${appShortId}
+          result: short_id_response
+        retry: ${http.default_retry}
+
+    - return_output:
+        return: ${short_id_response.body}
+
+#############################################################################################
+# CREATE A RESOURCE/MODULE SERVICE ACCOUNT
+#############################################################################################
+account_create_workflow:
+  params: [accountId, service, outputs]
+  steps:
+
+    - check_account_type:
+        switch:
+          - condition: ${service == null}
+            next: createModuleAccount
+          - condition: ${true}
+            next: createResourceAccount
+
+    - createModuleAccount:
+        try:
+          call: http.post
+          args:
+            url: ${"{{HOST_URL}}/workflow/createModuleAccount"}
+            auth:
+              type: OIDC
+              audience: {{HOST_URL}}
+            body:
+              moduleId: ${accountId}
+              outputs: ${outputs}
+          result: account_response
+        retry: ${http.default_retry}
+        next: return_output
+
+    - createResourceAccount:
+        try:
+          call: http.post
+          args:
+            url: ${outputs.services[service].url + "/accounts"}
+            auth:
+              type: OIDC
+              audience: ${outputs.services[service].url}
+            body:
+              resourceId: ${accountId}
+          result: account_response 
+        retry: ${http.default_retry}
+
+    - return_output:
+        return: ${account_response.body}
+
+#############################################################################################
+# DELETE A RESOURCE/MODULE SERVICE ACCOUNT 
+#############################################################################################
+account_delete_workflow:
+  params: [accountId, service, outputs]
+  steps:
+
+    - check_account_type:
+        switch:
+          - condition: ${service == null}
+            next: deleteModuleAccount
+          - condition: ${true}
+            next: deleteResourceAccount
+
+    - deleteModuleAccount:
+        try:
+          call: http.post
+          args:
+            url: ${"{{HOST_URL}}/workflow/deleteModuleAccount"}
+            auth:
+              type: OIDC
+              audience: {{HOST_URL}}
+            body:
+              moduleId: ${accountId}
+              outputs: ${outputs}
+          result: account_response
+        retry: ${http.default_retry}
+        next: return_output
+
+    - deleteResourceAccount:
+        try:
+          call: http.delete
+          args:
+            url: ${outputs.services[service].url + "/accounts/" + accountId}
+            auth:
+              type: OIDC
+              audience: ${outputs.services[service].url}
+          result: account_response
+        retry: ${http.default_retry}
+
+    - return_output:
+        return: ${account_response.body}
+
+#############################################################################################
+# DEPLOY A RESOURCE
+#############################################################################################
+resource_deploy_workflow:
+  params: [appId, appShortId, planId, resourceId, resource, masterActions, outputs]
+  steps:
+
+    - call_create_resource:
+        try:
+          call: http.post
+          args:
+            url: ${outputs.services[resource.service].url + "/resources"}
+            auth:
+              type: OIDC
+              audience: ${outputs.services[resource.service].url}
+            body:
+              resourceId: ${resourceId}
+              resource: ${resource}
+              masterActions: ${masterActions}
+              outputs: ${outputs}
+          result: execution 
+          #result soit c est une execution et on attend du coup, soit c est le resultat direct ok ?
+        retry: ${http.default_retry}
+
+    - poll_execution_result:
+        call: polling_workflow
+        args:
+          serviceUrl: ${outputs.services[resource.service].url}
+          execution: ${execution}
+        result: result
+        
+    - return_output:
+        return: ${result}
+
+#############################################################################################
+# DESTROY A RESOURCE
+#############################################################################################
+resource_destroy_workflow:
+  params: [appId, appShortId, planId, resourceId, resource, masterActions, outputs]
+  steps:
+
+    - call_destroy_resource:
+        try:
+          call: http.delete
+          args:
+            url: ${outputs.services[resource.service].url + "/resources"}
+            auth:
+              type: OIDC
+              audience: ${outputs.services[resource.service].url}
+            body:
+              resourceId: ${resourceId}
+              masterActions: ${masterActions}
+              outputs: ${outputs}
+          result: execution 
+        retry: ${http.default_retry}
+
+    - poll_execution_result:
+        call: polling_workflow
+        args:
+          serviceUrl: ${outputs.services[resource.service].url}
+          execution: ${execution}
+        result: result
+        
+    - return_output:
+        return: ${result}
+
+
+#############################################################################################
+# DESTROY A LAYER - NOOP - the layer is never deleted
+#############################################################################################
+service_layer_destroy_workflow:
+  params: [appId, appShortId, planId, layerId, layer, outputs]
+  steps:
+        
+    - return_output:
+        return: {}
+
+#############################################################################################
+# POOLING SUB WORKFLOW
+#############################################################################################
+polling_workflow:
+  params: [serviceUrl, execution]
+  steps:
+
+    - check_finished_sync:
+        switch:
+          - condition: ${execution.body.state == "SUCCEEDED"}
+            next: return_output
+          - condition: ${execution.body.state != "ACTIVE"}
+            raise: Failed to create a resource.
+
+    - initial_wait:
+        call: sys.sleep
+        args:
+          seconds: 5
+        next: check_status
+
+    - check_status:
+        try:
+          call: http.get
+          args:
+            url: ${serviceUrl + "/executions/" + execution.body.executionId}
+            auth:
+              type: OIDC
+              audience: ${serviceUrl}
+          result: execution
+        retry: ${http.default_retry}
+
+    - check_finished:
+        switch:
+          - condition: ${execution.body.state == "SUCCEEDED"}
+            next: return_output
+          - condition: ${execution.body.state != "ACTIVE"}
+            raise: ${execution.body.error}
+
+    - wait:
+        call: sys.sleep
+        args:
+          seconds: 10
+        next: check_status
+        
+    - return_output:
+        return: ${execution.body.output}

@@ -1,0 +1,218 @@
+swagger: '2.0'
+info:
+  title: BlueForge APIs
+  description: BlueForge APIs
+  version: 1.0.0
+host: HOST
+schemes:
+  - https
+produces:
+  - application/json
+paths:
+
+############ APPS ###########
+
+  /apps/{organization}/{appName}:
+    put:
+      summary: deploy an application.
+      operationId: deployApplication
+      parameters:
+        - name: organization
+          in: path
+          description: the org id
+          required: true
+          type: string
+        - name: appName
+          in: path
+          description: the app name
+          required: true
+          type: string
+      x-google-backend:
+        address: ${hostUrl}
+        path_translation: APPEND_PATH_TO_ADDRESS
+      responses:
+        '200':
+          description: deploy an application.
+          schema:
+            type: string
+      security:
+      - custom_auth: []
+    get:
+      summary: get an application.
+      operationId: getApplication
+      parameters:
+        - name: organization
+          in: path
+          description: the org id
+          required: true
+          type: string
+        - name: appName
+          in: path
+          description: the app name
+          required: true
+          type: string
+      x-google-backend:
+        address: ${hostUrl}
+        path_translation: APPEND_PATH_TO_ADDRESS
+      responses:
+        '200':
+          description: get an application.
+          schema:
+            type: string
+      security:
+      - custom_auth: []
+
+  /apps/{organization}/{appName}/resources/{resourceId}:
+    get:
+      summary: get a resource.
+      operationId: getResource
+      parameters:
+        - name: organization
+          in: path
+          description: the org id
+          required: true
+          type: string
+        - name: appName
+          in: path
+          description: the app name
+          required: true
+          type: string
+        - name: resourceId
+          in: path
+          description: the resource id
+          required: true
+          type: string          
+      x-google-backend:
+        address: ${hostUrl}
+        path_translation: APPEND_PATH_TO_ADDRESS
+      responses:
+        '200':
+          description: get a resource.
+          schema:
+            type: string
+      security:
+      - custom_auth: []
+
+  /apps/{organization}/{appName}/plans/{planId}:
+    get:
+      summary: get an application plan.
+      operationId: getApplicationPlan
+      parameters:
+        - name: organization
+          in: path
+          description: the org id
+          required: true
+          type: string
+        - name: appName
+          in: path
+          description: the app name
+          required: true
+          type: string
+        - name: planId
+          in: path
+          description: the plan id
+          required: true
+          type: string
+      x-google-backend:
+        address: ${hostUrl}
+        path_translation: APPEND_PATH_TO_ADDRESS
+      responses:
+        '200':
+          description: get an application plan.
+          schema:
+            type: string
+      security:
+      - custom_auth: []
+
+  /apps/{organization}/{appName}/resources/{resourceId}/metrics/{metric}:
+    get:
+      summary: get a pre-fetched metric
+      operationId: getCachedMetric
+      parameters:
+        - name: organization
+          in: path
+          description: the org id
+          required: true
+          type: string
+        - name: appName
+          in: path
+          description: the app name
+          required: true
+          type: string
+        - name: resourceId
+          in: path
+          description: the resource id
+          required: true
+          type: string    
+        - name: metric
+          in: path
+          description: the metric name
+          required: true
+          type: string          
+      x-google-backend:
+        address: ${hostUrl}
+        path_translation: APPEND_PATH_TO_ADDRESS
+      responses:
+        '200':
+          description: get a pre-fetched metric.
+          schema:
+            type: string
+      security:
+      - custom_auth: []
+
+  /apps/{organization}/{appName}/services/{serviceId}/metrics/{metric}:
+    post:
+      summary: get a metric for multiple resources.
+      operationId: getMetric
+      parameters:
+        - name: organization
+          in: path
+          description: the org id
+          required: true
+          type: string
+        - name: appName
+          in: path
+          description: the app name
+          required: true
+          type: string
+        - name: serviceId
+          in: path
+          description: the service id
+          required: true
+          type: string    
+        - name: metric
+          in: path
+          description: the metric name
+          required: true
+          type: string          
+      x-google-backend:
+        address: ${hostUrl}
+        path_translation: APPEND_PATH_TO_ADDRESS
+      responses:
+        '200':
+          description: get a metric.
+          schema:
+            type: string
+      security:
+      - custom_auth: []
+
+
+
+securityDefinitions:
+#  firebase:
+#    authorizationUrl: ""
+#    flow: "implicit"
+#    type: "oauth2"
+#    x-google-issuer: "https://securetoken.google.com/blueforge-322008"
+#    x-google-jwks_uri: "https://www.googleapis.com/service_accounts/v1/metadata/x509/securetoken@system.gserviceaccount.com"
+#    x-google-audiences: "blueforge-322008"
+
+  custom_auth:
+    authorizationUrl: ""
+    flow: "implicit"
+    type: "oauth2"
+    # The value below should be unique
+    x-google-issuer: "blueforge"
+    x-google-jwks_uri: "http://www.blueforge.cloud/key/@${organization}/${hostName}"
+    # Optional. Replace YOUR-CLIENT-ID with your client ID
+    x-google-audiences: "blueforge-322008"
