@@ -4,8 +4,28 @@ steps:
     name: gcr.io/cloud-builders/gcloud
     entrypoint: bash
     args:
-      - -c
-      - ./deploy.sh --hostId="${_HOST_ID}" --location="${_LOCATION}" --hostShortId="${_HOST_SHORT_ID}"
+      - '-c'
+      - |
+        chmod +x setup.sh
+        
+        # Execute setup and capture only the last line (the URL)
+        OUTPUT=$(./setup.sh \
+          --hostId=${_HOST_ID} \
+          --location=${_LOCATION} \
+          --hostShortId=${_HOST_SHORT_ID})
+        
+        # Extract the URL from the last line of output
+        AGENT_HOST_URL=$(echo "$OUTPUT" | tail -n 1)
+        
+        # Print the full output for logging
+        echo "$OUTPUT"
+        
+        # Create builder output
+        echo "{\"url\":\"${AGENT_HOST_URL}\"}" > ${_BUILDER_OUTPUT}/output
+        
+        echo ""
+        echo "Builder output created:"
+        cat ${_BUILDER_OUTPUT}/output
 
 substitutions:
   _HOST_ID: "@default/my-first-host"
